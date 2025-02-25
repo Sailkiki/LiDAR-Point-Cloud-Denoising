@@ -2,6 +2,54 @@ import torch
 import torch.nn as nn
 
 
+class AdaptiveResnetBlockConv1d(nn.Module):
+    """动态调制残差块（带空间-条件注意力）"""
+    def __init__(self, c_dim, size_in, size_h=None, size_out=None, 
+                 norm_method='batch_norm', legacy=False):
+        super().__init__()
+        # 原始残差块初始化
+        if size_h is None: size_h = size_in
+        if size_out is None: size_out = size_in
+        
+        self.bn0 = nn.BatchNorm1d(size_in)
+        self.bn1 = nn.BatchNorm1d(size_h)
+        
+        self.fc0 = nn.Conv1d(size_in, size_h, 1)
+        self.fc1 = nn.Conv1d(size_h, size_out, 1)
+        self.fc_c = nn.Conv1d(c_dim, size_out, 1)
+        self.actvn = nn.ReLU()
+        
+        self.shortcut = nn.Conv1d(size_in, size_out, 1) if size_in != size_out else None
+        
+        # 新增动态调制组件
+        self.channel_gate = nn.Sequential(
+            nn.Linear(c_dim, size_out),
+            nn.Sigmoid()
+        )
+        self.spatial_attn = nn.Sequential(
+            nn.Conv1d(size_out, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, c):
+        # 原始前向传播
+        net = self.fc0(self.actvn(self.bn0(x)))
+        dx = self.fc1(self.actvn(self.bn1(net)))
+      
+
+        # 动态通道调制
+        gamma = self.channel_gate(c.mean(dim=-1))  # [B,C]
+        dx = dx * gamma.unsqueeze(-1)  # 广播到特征维度
+        
+        # 空间注意力增强
+        attn_map = self.spatial_attn(dx)
+        dx = dx * attn_map
+        
+        # 残差连接
+        x = x if self.shortcut is None else self.shortcut(x)
+        return x + dx + self.fc_c(c)
+
+
 class ResnetBlockConv1d(nn.Module):
     """ 1D-Convolutional ResNet block class.
     Args:
@@ -81,7 +129,7 @@ class ScoreNet(nn.Module):
         c_dim = z_dim + dim
         self.conv_p = nn.Conv1d(c_dim, hidden_size, 1)
         self.blocks = nn.ModuleList([
-            ResnetBlockConv1d(c_dim, hidden_size) for _ in range(num_blocks)
+            AdaptiveResnetBlockConv1d(c_dim, hidden_size) for _ in range(num_blocks)
         ])
         self.bn_out = nn.BatchNorm1d(hidden_size)
         self.conv_out = nn.Conv1d(hidden_size, out_dim, 1)
