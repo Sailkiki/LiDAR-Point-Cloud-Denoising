@@ -1,8 +1,8 @@
 import torch
-from torch.nn import Module, Linear, ModuleList
+from torch.nn import Module, Linear, ModuleList, Parameter
 from .utils import *
 from .feature import *
-
+import torch.nn.functional as F
 
 class DenseEdgeConv(Module):
 
@@ -16,6 +16,9 @@ class DenseEdgeConv(Module):
         self.num_fc_layers = num_fc_layers # 3
         self.growth_rate = growth_rate # 12
         self.relative_feat_only = relative_feat_only
+
+        # 增加注意力权重参数
+        self.attention_weights = Parameter(torch.ones(3) / 3.0)
 
         self.layer_first = FCLayer_first(3*in_channels, 
                                          4*in_channels, 
@@ -36,7 +39,7 @@ class DenseEdgeConv(Module):
                                   bias=True, 
                                   ))
 
-        self.aggr = Aggregator(aggr)
+        self.aggr = LearnableAggregator(aggr, in_channels + num_fc_layers * growth_rate)
 
     @property
     def out_channels(self):
@@ -85,3 +88,30 @@ class DenseEdgeConv(Module):
         y = self.aggr(y, dim=-2)
 
         return y
+
+
+
+class LearnableAggregator(Module):
+    def __init__(self, base_aggr='max', channels=64):
+        super().__init__()
+        self.base_aggr = Aggregator(base_aggr)
+        self.attention = nn.Sequential(
+            nn.Linear(channels, channels // 4),
+            nn.ReLU(),
+            nn.Linear(channels // 4, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, dim=-2):
+        base_res = self.base_aggr(x, dim)
+        B, N, K, C = x.shape
+        x_flat = x.view(B*N, K, C)
+        weights = self.attention(x_flat).view(B*N, K, 1)
+        weights = F.softmax(weights, dim=1)
+        
+        # 加权聚合
+        weighted_x = x_flat * weights
+        weighted_result = weighted_x.sum(dim=1).view(B, N, C)
+        
+        # 结合两种聚合结果
+        return 0.5 * base_res + 0.5 * weighted_result
