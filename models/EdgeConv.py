@@ -1,12 +1,29 @@
 import torch
-from torch.nn import Module, Linear, ModuleList, Parameter
+from torch.nn import Module, Linear, ModuleList
 from .utils import *
 from .feature import *
-import torch.nn.functional as F
+
+
+class OffsetPredictor(Module):
+    """预测每个点的位置偏移量"""
+    def __init__(self, in_channels, hidden_dim=64):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            Linear(in_channels, hidden_dim),
+            nn.ReLU(),
+            Linear(hidden_dim, 24),  # 输出三维偏移量 (Δx, Δy, Δz)
+            nn.Tanh()               # 限制偏移量范围在[-1,1]之间
+        )
+        
+    def forward(self, x):
+        return self.mlp(x) * 0.1    # 缩放偏移量，防止过大扰动
+    
+
 
 class DenseEdgeConv(Module):
 
-    def __init__(self, in_channels, num_fc_layers, growth_rate, knn=16, aggr='max', activation='relu', relative_feat_only=False):
+    def __init__(self, in_channels, num_fc_layers, growth_rate, knn=16, aggr='max',
+                  activation='relu', relative_feat_only=False, use_deformable=False):
         super().__init__()
         
         assert num_fc_layers > 2
@@ -17,29 +34,29 @@ class DenseEdgeConv(Module):
         self.growth_rate = growth_rate # 12
         self.relative_feat_only = relative_feat_only
 
-        # 增加注意力权重参数
-        self.attention_weights = Parameter(torch.ones(3) / 3.0)
+        self.use_deformable = use_deformable
+        if self.use_deformable:
+            self.offset_predictor = OffsetPredictor(in_channels)
+            self.adaptive_knn = int(knn * 1.5)  # 扩大候选邻域数量
 
-        self.layer_first = FCLayer_first(3*in_channels, 
-                                         4*in_channels, 
-                                         growth_rate, 
-                                         bias=True)
+        if self.use_deformable:
+            self.edge_attention = nn.Sequential(
+                Linear(in_channels, 12),
+                nn.ReLU(),
+                Linear(12, 16)
+            )
 
-        self.layer_last = FCLayer(in_channels + (num_fc_layers - 1) * growth_rate, 
-                                  growth_rate, 
-                                  bias=True, 
-                                  activation=None)
+
+        self.layer_first = FCLayer_first(3*in_channels, 4*in_channels, growth_rate, bias=True)
+
+        self.layer_last = FCLayer(in_channels + (num_fc_layers - 1) * growth_rate, growth_rate, bias=True, activation=None)
 
         self.layers = ModuleList()
 
         for i in range(1, num_fc_layers-1):
-            self.layers.append(MlpX(in_channels + i * growth_rate, 
-                                  (in_channels + i * growth_rate) * 2, 
-                                  growth_rate, 
-                                  bias=True, 
-                                  ))
+            self.layers.append(FCLayer(in_channels + i * growth_rate, growth_rate, bias=True, activation=activation))
 
-        self.aggr = LearnableAggregator(aggr, in_channels + num_fc_layers * growth_rate)
+        self.aggr = Aggregator(aggr)
 
     @property
     def out_channels(self):
@@ -62,7 +79,19 @@ class DenseEdgeConv(Module):
         :param  x:  (B, N, d)
         :return (B, N, d+L*c)
         """
-        knn_idx = get_knn_idx(pos, pos, k=self.knn, offset=1)
+        if self.use_deformable:
+            # 预测位置偏移量
+            offsets = self.offset_predictor(x) 
+            deformed_pos = pos + offsets
+            # 基于变形后坐标计算扩展的KNN索引
+            knn_idx = get_knn_idx(deformed_pos, deformed_pos, k=self.adaptive_knn, offset=1)
+            # 重要性采样：选择最相关的k个邻居
+            edge_feat = self.get_edge_feature(x, knn_idx)  # (B, N, K, 3d)
+            attention = torch.sigmoid(self.edge_attention(edge_feat.mean(dim=-1)))  # (B, N, K)
+            topk_idx = torch.topk(attention, self.knn, dim=-1)[1]  # (B, N, k)
+            knn_idx = torch.gather(knn_idx, -1, topk_idx)  # 最终knn索引
+        else:
+            knn_idx = get_knn_idx(pos, pos, k=self.knn, offset=1)
         
         # First Layer
         edge_feat = self.get_edge_feature(x, knn_idx)
@@ -88,30 +117,3 @@ class DenseEdgeConv(Module):
         y = self.aggr(y, dim=-2)
 
         return y
-
-
-
-class LearnableAggregator(Module):
-    def __init__(self, base_aggr='max', channels=64):
-        super().__init__()
-        self.base_aggr = Aggregator(base_aggr)
-        self.attention = nn.Sequential(
-            nn.Linear(channels, channels // 4),
-            nn.ReLU(),
-            nn.Linear(channels // 4, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x, dim=-2):
-        base_res = self.base_aggr(x, dim)
-        B, N, K, C = x.shape
-        x_flat = x.view(B*N, K, C)
-        weights = self.attention(x_flat).view(B*N, K, 1)
-        weights = F.softmax(weights, dim=1)
-        
-        # 加权聚合
-        weighted_x = x_flat * weights
-        weighted_result = weighted_x.sum(dim=1).view(B, N, C)
-        
-        # 结合两种聚合结果
-        return 0.5 * base_res + 0.5 * weighted_result
