@@ -4,16 +4,68 @@ from .utils import *
 from .feature import *
 
 class ChannelGate(Module):
-    def __init__(self, channels):
+    def __init__(self, channels, reduction_ratio=16, pool_types=['avg', 'max']):
         super().__init__()
-        self.gate = Linear(channels, channels) # (60, 60)
+        
+        self.channels = channels
+        self.pool_types = pool_types
+        
+        # 多层感知机
+        self.mlp = nn.Sequential(
+            Linear(channels, channels // reduction_ratio),
+            nn.ReLU(),
+            Linear(channels // reduction_ratio, channels // reduction_ratio),
+            nn.ReLU(),
+            Linear(channels // reduction_ratio, channels)
+        )
+        
+        # 空间注意力
+        self.spatial_gate = nn.Sequential(
+            Linear(2, 1),
+            nn.Sigmoid()
+        )
+        
+        # SE-style 通道注意力
+        self.channel_gate = nn.Sequential(
+            Linear(channels, channels // reduction_ratio),
+            nn.ReLU(),
+            Linear(channels // reduction_ratio, channels),
+            nn.Sigmoid()
+        )
+        
     def forward(self, x):
-        # 全局平均池化 (B, N, C)
-        global_feat = x.mean(dim=2)
-        # 动态生成门控权重 (B, N, C)
-        gate_weights = torch.sigmoid(self.gate(global_feat).transpose(1,2)).transpose(1,2)
-        # 应用门控权重
-        return x * gate_weights.unsqueeze(2)  # 扩展为 (B, N, K, C)
+        b, n, k, c = x.size()  # batch, num_points, k_neighbors, channels
+        
+        # 1. 多池化策略
+        channel_att_sum = None
+        for pool_type in self.pool_types:
+            if pool_type == 'avg':
+                pool_feat = x.mean(dim=2)  # (B, N, C)
+            elif pool_type == 'max':
+                pool_feat = x.max(dim=2)[0]  # (B, N, C)
+            
+            if channel_att_sum is None:
+                channel_att_sum = self.mlp(pool_feat)
+            else:
+                channel_att_sum += self.mlp(pool_feat)
+                
+        scale = torch.sigmoid(channel_att_sum).unsqueeze(2)  # (B, N, 1, C)
+        
+        # 2. 空间注意力
+        avg_pool = torch.mean(x, dim=-1, keepdim=True)  # (B, N, K, 1)
+        max_pool = torch.max(x, dim=-1, keepdim=True)[0]  # (B, N, K, 1)
+        spatial_feat = torch.cat([avg_pool, max_pool], dim=-1)  # (B, N, K, 2)
+        spatial_att = self.spatial_gate(spatial_feat)  # (B, N, K, 1)
+        
+        # 3. SE-style 通道注意力
+        se_feat = x.mean(dim=2)  # (B, N, C)
+        channel_att = self.channel_gate(se_feat).unsqueeze(2)  # (B, N, 1, C)
+        
+        # 组合所有注意力机制
+        att = scale * spatial_att * channel_att
+        
+        # 残差连接
+        return x * att + x
 
 class OffsetPredictor(Module):
     """预测每个点的位置偏移量"""
@@ -109,8 +161,6 @@ class DenseEdgeConv(Module):
             x.unsqueeze(-2).repeat(1, 1, self.knn, 1) # (B, N, K, d)
         ], dim=-1)  # (B, N, K, d+c)
 
-        # print(y.shape)
-        # y = self.channel_gate1(y)
 
         # Intermediate Layers
         for layer in self.layers:
@@ -126,7 +176,6 @@ class DenseEdgeConv(Module):
             y                   # (B, N, K, d+(L-1)*c)
         ], dim=-1)  # (B, N, K, d+L*c)
 
-        # y = self.channel_gate3(y)
         # Pooling
         y = self.aggr(y, dim=-2)
 
