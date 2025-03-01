@@ -34,6 +34,22 @@ class DenoiseNet(nn.Module):
             num_blocks=args.score_net_num_blocks,
         )
 
+    def fps_sampling(points, n_points):
+        """FPS采样, 返回采样索引"""
+        B, N, D = points.size()
+        centroids = torch.zeros(B, n_points, dtype=torch.long, device=points.device)
+        distance = torch.ones(B, N, device=points.device) * 1e10
+        # 随机选择第一个点
+        farthest = torch.randint(0, N, (B,), dtype=torch.long, device=points.device)
+        for i in range(n_points):
+            centroids[:, i] = farthest
+            centroid = points[torch.arange(B), farthest, :].unsqueeze(1)
+            dist = torch.sum((points - centroid) ** 2, -1)
+            mask = dist < distance
+            distance[mask] = dist[mask]
+            farthest = torch.max(distance, -1)[1]
+        return centroids
+
     def get_supervised_loss(self, pcl_noisy, pcl_clean):
         """
         Denoising score matching.
@@ -74,9 +90,21 @@ class DenoiseNet(nn.Module):
         ).reshape(B, len(pnt_idx), self.frame_knn, d)   # (B, n, K, 3)
         grad_target = - 1 * noise_vecs   # (B, n, K, 3)
 
-        loss = 0.5 * ((grad_target - grad_pred) ** 2.0 * (1.0 / self.dsm_sigma)).sum(dim=-1).mean()
+        # loss = 0.5 * ((grad_target - grad_pred) ** 2.0 * (1.0 / self.dsm_sigma)).sum(dim=-1).mean()
         
-        return loss #, target, scores, noise_vecs
+        # return loss #, target, scores, noise_vecs
+        diff = grad_target - grad_pred
+        delta = 1.0  # Huber loss 的阈值参数，可以根据需要调整
+        huber_loss = torch.where(
+            torch.abs(diff) <= delta,
+            0.5 * diff ** 2,
+            delta * torch.abs(diff) - 0.5 * delta ** 2
+        )
+
+        loss = (huber_loss * (1.0 / self.dsm_sigma)).sum(dim=-1).mean()
+
+        return loss
+
 
     def get_selfsupervised_loss(self, pcl_noisy):
         """
