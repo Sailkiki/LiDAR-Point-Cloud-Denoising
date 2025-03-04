@@ -1,53 +1,6 @@
 import torch
 import torch.nn as nn
-
-
-class AdaptiveResnetBlockConv1d(nn.Module):
-    """动态调制残差块（带空间-条件注意力）"""
-    def __init__(self, c_dim, size_in, size_h=None, size_out=None, 
-                 norm_method='batch_norm', legacy=False):
-        super().__init__()
-        # 原始残差块初始化
-        if size_h is None: size_h = size_in
-        if size_out is None: size_out = size_in
-        
-        self.bn0 = nn.BatchNorm1d(size_in)
-        self.bn1 = nn.BatchNorm1d(size_h)
-        
-        self.fc0 = nn.Conv1d(size_in, size_h, 1)
-        self.fc1 = nn.Conv1d(size_h, size_out, 1)
-        self.fc_c = nn.Conv1d(c_dim, size_out, 1)
-        self.actvn = nn.ReLU()
-        
-        self.shortcut = nn.Conv1d(size_in, size_out, 1) if size_in != size_out else None
-        
-        # 新增动态调制组件
-        self.channel_gate = nn.Sequential(
-            nn.Linear(c_dim, size_out),
-            nn.Sigmoid()
-        )
-        self.spatial_attn = nn.Sequential(
-            nn.Conv1d(size_out, 1, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x, c):
-        # 原始前向传播
-        net = self.fc0(self.actvn(self.bn0(x)))
-        dx = self.fc1(self.actvn(self.bn1(net)))
-      
-
-        # 动态通道调制
-        gamma = self.channel_gate(c.mean(dim=-1))  # [B,C]
-        dx = dx * gamma.unsqueeze(-1)  # 广播到特征维度
-        
-        # 空间注意力增强
-        attn_map = self.spatial_attn(dx)
-        dx = dx * attn_map
-        
-        # 残差连接
-        x = x if self.shortcut is None else self.shortcut(x)
-        return x + dx + self.fc_c(c)
+import torch.nn.functional as F
 
 
 class ResnetBlockConv1d(nn.Module):
@@ -59,8 +12,9 @@ class ResnetBlockConv1d(nn.Module):
     """
 
     def __init__(self, c_dim, size_in, size_h=None, size_out=None,
-                 norm_method='batch_norm', legacy=False):
+                norm_method='batch_norm', legacy=False):
         super().__init__()
+
         # Attributes
         if size_h is None:
             size_h = size_in
@@ -91,6 +45,8 @@ class ResnetBlockConv1d(nn.Module):
         else:
             self.shortcut = nn.Conv1d(size_in, size_out, 1, bias=False)
 
+        
+
         # Initialization
         nn.init.zeros_(self.fc_1.weight)
 
@@ -106,6 +62,65 @@ class ResnetBlockConv1d(nn.Module):
         out = x_s + dx + self.fc_c(c)
 
         return out
+
+
+class Enhanced(nn.Module):
+    def __init__(self, c_dim, size_in, size_h=None, size_out=None,
+                 norm_method='batch_norm', dropout_rate=0.1):
+        super().__init__()
+        
+        # 设置维度
+        if size_h is None:
+            size_h = size_in
+        if size_out is None:
+            size_out = size_in
+        self.size_in = size_in
+        self.size_h = size_h
+        self.size_out = size_out
+        norm = nn.BatchNorm1d if norm_method == 'batch_norm' else nn.SyncBatchNorm
+        self.main_path = nn.Sequential(
+            norm(size_in),
+            nn.GELU(),  
+            nn.Conv1d(size_in, size_h, 1),
+            nn.Dropout(dropout_rate),
+            norm(size_h),
+            nn.GELU(),
+            nn.Conv1d(size_h, size_out, 1),
+        )
+        self.attention = nn.Sequential(
+            nn.Conv1d(size_out, size_out // 4, 1),
+            nn.GELU(),
+            nn.Conv1d(size_out // 4, size_out, 1),
+            nn.Sigmoid()
+        )
+        self.condition_path = nn.Sequential(
+            nn.Conv1d(c_dim, c_dim // 2, 1),
+            nn.GELU(),
+            nn.Conv1d(c_dim // 2, size_out, 1)
+        )
+        self.shortcut = None if size_in == size_out else \
+            nn.Conv1d(size_in, size_out, 1, bias=False)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(size_out, size_out // 8, 1),
+            nn.GELU(),
+            nn.Conv1d(size_out // 8, size_out, 1),
+            nn.Sigmoid()
+        )
+        
+        self.output_scale = nn.Parameter(torch.ones(1))
+        
+    def forward(self, x, c):
+        main = self.main_path(x)
+        att = self.attention(main)
+        main = main * att
+        se_weight = self.se(main)
+        main = main * se_weight
+        cond = self.condition_path(c)
+        skip = self.shortcut(x) if self.shortcut else x
+        out = skip + main + cond
+        return out * self.output_scale
+
 
 
 class ScoreNet(nn.Module):
@@ -124,16 +139,24 @@ class ScoreNet(nn.Module):
         self.out_dim = out_dim
         self.hidden_size = hidden_size
         self.num_blocks = num_blocks
-
         # Input = Conditional = zdim (code) + dim (xyz)
         c_dim = z_dim + dim
+        # print(c_dim, hidden_size) # 63, 128
         self.conv_p = nn.Conv1d(c_dim, hidden_size, 1)
         self.blocks = nn.ModuleList([
-            AdaptiveResnetBlockConv1d(c_dim, hidden_size) for _ in range(num_blocks)
+            ResnetBlockConv1d(c_dim, hidden_size) for _ in range(num_blocks)
         ])
+
         self.bn_out = nn.BatchNorm1d(hidden_size)
         self.conv_out = nn.Conv1d(hidden_size, out_dim, 1)
         self.actvn_out = nn.ReLU()
+
+        # 添加特征融合层
+        self.fusion = nn.Sequential(
+            nn.Conv1d(hidden_size*2, hidden_size, 1),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU()
+        )
 
     def forward(self, x, c):
         """
@@ -145,7 +168,7 @@ class ScoreNet(nn.Module):
         batch_size, D, num_points = p.size()
 
         c_expand = c.unsqueeze(2).expand(-1, -1, num_points)
-        c_xyz = torch.cat([p, c_expand], dim=1)
+        c_xyz = torch.cat([p, c_expand], dim=1) # 4096, 63, 32
         net = self.conv_p(c_xyz)
         for block in self.blocks:
             net = block(net, c_xyz)
